@@ -868,7 +868,7 @@ impl DataActor for PassiveLimitOrders {
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        self.cancel_all_orders(self.instrument_id, None, None, None)
+        self.cancel_all_orders(self.instrument_id, None, None, true, None)
     }
 }
 
@@ -1211,7 +1211,7 @@ impl DataActor for OrderTypeSweep {
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        self.cancel_all_orders(self.instrument_id, None, None, None)
+        self.cancel_all_orders(self.instrument_id, None, None, true, None)
     }
 }
 

@@ -945,6 +945,10 @@ pub trait Strategy: DataActor {
 
     /// Cancels all open orders for the given instrument.
     ///
+    /// When `strategy_only` is `true`, only orders owned by this strategy are canceled. When
+    /// `false`, a [`CancelAllOrders`] command is sent to the execution engine (or the order emulator
+    /// for emulated orders) and may cancel orders owned by other strategies for the same instrument.
+    ///
     /// # Errors
     ///
     /// Returns an error if the strategy is not registered or order cancellation fails.
@@ -953,6 +957,7 @@ pub trait Strategy: DataActor {
         instrument_id: InstrumentId,
         order_side: Option<OrderSide>,
         client_id: Option<ClientId>,
+        strategy_only: bool,
         params: Option<Params>,
     ) -> anyhow::Result<()>
     where
@@ -966,29 +971,41 @@ pub trait Strategy: DataActor {
         let ts_init = core.clock_mut().timestamp_ns();
         let cache = core.cache_ref();
 
-        let open_count = cache.orders_open_count(
-            None,
-            Some(&instrument_id),
-            Some(&strategy_id),
-            None,
-            order_side,
-        );
+        let mut open_orders: Vec<OrderAny> = cache
+            .orders_open(
+                None,
+                Some(&instrument_id),
+                Some(&strategy_id),
+                None,
+                order_side,
+            )
+            .into_iter()
+            .map(|order| order.clone())
+            .collect();
 
-        let emulated_count = cache.orders_emulated_count(
-            None,
-            Some(&instrument_id),
-            Some(&strategy_id),
-            None,
-            order_side,
-        );
+        let mut emulated_orders: Vec<OrderAny> = cache
+            .orders_emulated(
+                None,
+                Some(&instrument_id),
+                Some(&strategy_id),
+                None,
+                order_side,
+            )
+            .into_iter()
+            .map(|order| order.clone())
+            .collect();
 
-        let inflight_count = cache.orders_inflight_count(
-            None,
-            Some(&instrument_id),
-            Some(&strategy_id),
-            None,
-            order_side,
-        );
+        let mut inflight_orders: Vec<OrderAny> = cache
+            .orders_inflight(
+                None,
+                Some(&instrument_id),
+                Some(&strategy_id),
+                None,
+                order_side,
+            )
+            .into_iter()
+            .map(|order| order.clone())
+            .collect();
 
         // Sort the algorithm IDs so the per-algo cancel cascade fires msgbus
         // events in a deterministic order across runs; the cache returns an
@@ -1013,7 +1030,46 @@ pub trait Strategy: DataActor {
             );
         }
 
+        if strategy_only {
+            let matches_client = |order: &OrderAny| {
+                client_id.is_none_or(|client_id| {
+                    cache
+                        .client_id(&order.client_order_id())
+                        .is_none_or(|order_client_id| *order_client_id == client_id)
+                })
+            };
+
+            open_orders.retain(&matches_client);
+            emulated_orders.retain(&matches_client);
+            inflight_orders.retain(&matches_client);
+            algo_orders.retain(&matches_client);
+        }
+
+        let open_count = open_orders.len();
+        let emulated_count = emulated_orders.len();
+        let inflight_count = inflight_orders.len();
         let algo_count = algo_orders.len();
+
+        let mut cancel_routes = Vec::new();
+
+        if strategy_only {
+            cancel_routes.extend(
+                open_orders
+                    .iter()
+                    .chain(&emulated_orders)
+                    .chain(&inflight_orders)
+                    .chain(&algo_orders)
+                    .map(|order| {
+                        (
+                            order.client_order_id(),
+                            client_id
+                                .or_else(|| cache.client_id(&order.client_order_id()).copied()),
+                        )
+                    }),
+            );
+            cancel_routes.sort_by_key(|(client_order_id, _)| *client_order_id);
+            cancel_routes.dedup_by_key(|(client_order_id, _)| *client_order_id);
+        }
 
         drop(cache);
 
@@ -1044,6 +1100,22 @@ pub trait Strategy: DataActor {
                 "Canceling {inflight_count} inflight{side_str} {instrument_id} order{}",
                 if inflight_count == 1 { "" } else { "s" }
             );
+        }
+
+        if strategy_only {
+            let mut first_error: Option<anyhow::Error> = None;
+
+            for (client_order_id, client_id) in cancel_routes {
+                if let Err(e) = self.cancel_order(client_order_id, client_id, params.clone()) {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    } else {
+                        log::error!("Error canceling {client_order_id}: {e}");
+                    }
+                }
+            }
+
+            return first_error.map_or(Ok(()), Err);
         }
 
         if open_count > 0 || inflight_count > 0 {
@@ -1696,7 +1768,7 @@ pub trait Strategy: DataActor {
         drop(cache);
 
         for instrument_id in instruments {
-            if let Err(e) = self.cancel_all_orders(instrument_id, None, None, None) {
+            if let Err(e) = self.cancel_all_orders(instrument_id, None, None, true, None) {
                 log::error!("Error canceling orders for {instrument_id}: {e}");
             }
 
@@ -3566,6 +3638,143 @@ mod tests {
             event_messages.first(),
             Some(OrderEventAny::PendingCancel(_))
         ));
+    }
+
+    #[rstest]
+    fn test_cancel_all_orders_strategy_only_sends_only_caller_strategy_cancels() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+
+        let (exec_handler, exec_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("ExecEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+
+        let order = make_accepted_market_order("O-20250208-CANCEL-ALL-001");
+        let mut sibling_order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(TraderId::from("TRADER-001"))
+            .strategy_id(StrategyId::from("SIBLING-001"))
+            .instrument_id(order.instrument_id())
+            .client_order_id(ClientOrderId::from("O-20250208-CANCEL-ALL-002"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from(100_000))
+            .build();
+        let account_id = AccountId::from("ACC-001");
+        sibling_order
+            .apply(TestOrderEventStubs::submitted(&sibling_order, account_id))
+            .unwrap();
+        sibling_order
+            .apply(TestOrderEventStubs::accepted(
+                &sibling_order,
+                account_id,
+                VenueOrderId::from("2"),
+            ))
+            .unwrap();
+        add_order_to_cache(&strategy, &order);
+        add_order_to_cache(&strategy, &sibling_order);
+        strategy.core.cache_rc().borrow_mut().build_index();
+
+        strategy
+            .cancel_all_orders(order.instrument_id(), None, None, true, None)
+            .unwrap();
+
+        let messages = exec_messages.get_messages();
+        let cache = strategy.cache();
+        let cached_order = cache.order(&order.client_order_id()).unwrap();
+        let cached_sibling = cache.order(&sibling_order.client_order_id()).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages.first(),
+            Some(TradingCommand::CancelOrder(command))
+                if command.client_order_id == order.client_order_id()
+        ));
+        assert_eq!(cached_order.status(), OrderStatus::PendingCancel);
+        assert_eq!(cached_sibling.status(), OrderStatus::Accepted);
+    }
+
+    #[rstest]
+    fn test_cancel_all_orders_without_strategy_only_sends_cancel_all_command() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+
+        let (exec_handler, exec_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("ExecEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+
+        let order = make_accepted_market_order("O-20250208-CANCEL-ALL-COMMAND-001");
+        add_order_to_cache(&strategy, &order);
+        strategy.core.cache_rc().borrow_mut().build_index();
+
+        strategy
+            .cancel_all_orders(order.instrument_id(), None, None, false, None)
+            .unwrap();
+
+        let messages = exec_messages.get_messages();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages.first(),
+            Some(TradingCommand::CancelAllOrders(command))
+                if command.strategy_id == order.strategy_id()
+                    && command.instrument_id == order.instrument_id()
+        ));
+    }
+
+    #[rstest]
+    fn test_cancel_all_orders_strategy_only_filters_by_client() {
+        let mut strategy = create_test_strategy();
+        register_strategy(&mut strategy);
+
+        let (exec_handler, exec_messages): (_, TypedIntoMessageSavingHandler<TradingCommand>) =
+            get_typed_into_message_saving_handler(Some(Ustr::from("ExecEngine.queue_execute")));
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::exec_engine_queue_execute(),
+            exec_handler,
+        );
+
+        let selected_client = ClientId::from("CLIENT-001");
+        let other_client = ClientId::from("CLIENT-002");
+        let selected_order = make_accepted_market_order("O-20250208-CANCEL-CLIENT-001");
+        let other_order = make_accepted_market_order("O-20250208-CANCEL-CLIENT-002");
+        let cache_rc = strategy.core.cache_rc();
+        {
+            let mut cache = cache_rc.borrow_mut();
+            cache
+                .add_order(selected_order.clone(), None, Some(selected_client), true)
+                .unwrap();
+            cache
+                .add_order(other_order.clone(), None, Some(other_client), true)
+                .unwrap();
+            cache.build_index();
+        }
+
+        strategy
+            .cancel_all_orders(
+                selected_order.instrument_id(),
+                None,
+                Some(selected_client),
+                true,
+                None,
+            )
+            .unwrap();
+
+        let messages = exec_messages.get_messages();
+        let cache = strategy.cache();
+        let cached_selected = cache.order(&selected_order.client_order_id()).unwrap();
+        let cached_other = cache.order(&other_order.client_order_id()).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages.first(),
+            Some(TradingCommand::CancelOrder(command))
+                if command.client_id == Some(selected_client)
+                    && command.client_order_id == selected_order.client_order_id()
+        ));
+        assert_eq!(cached_selected.status(), OrderStatus::PendingCancel);
+        assert_eq!(cached_other.status(), OrderStatus::Accepted);
     }
 
     #[rstest]

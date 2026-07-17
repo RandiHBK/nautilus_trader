@@ -89,6 +89,7 @@ adapter set. The following limits remain deferred:
 
 ### Breaking Changes
 - Changed v2 `PortfolioConfig.use_mark_prices` to prefer marks by default; set `false` to skip marks
+- Changed v2 `Strategy.cancel_all_orders` to put `strategy_only` before `params` (#4470), thanks for reporting @zurpet
 - Removed `DataActor` order fill/cancel callbacks and subscription methods; use the message bus
 - Renamed Python v2 `RedisMessageBusDatabase` to `RedisMessageBusBacking` (documenting a previous break)
 - Renamed Interactive Brokers PyO3 enum variants to uppercase names (e.g. `MarketDataType.DELAYED`) (#4350)
@@ -101,6 +102,7 @@ adapter set. The following limits remain deferred:
 
 ### Fixes
 - Fixed v2 PyO3 API coverage and Python exception handling
+- Fixed v2 `Strategy.cancel_all_orders` canceling sibling strategy orders (#4470), thanks for reporting @zurpet
 - Fixed Architect AX data and execution clients not refreshing authentication tokens for REST requests and WebSocket reconnects
 - Fixed v2 `BettingInstrument` catalog round trips deriving `raw_symbol` from the instrument ID and rebuilding `price_increment`/`size_increment` from precision, corrupting their values
 - Fixed v2 `FuturesContract`, `OptionContract`, `BinaryOption`, and `BettingInstrument` catalog round trips dropping quantity, price, and notional constraints, margins, and fees
