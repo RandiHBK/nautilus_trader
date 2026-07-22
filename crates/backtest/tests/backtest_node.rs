@@ -997,7 +997,12 @@ fn test_run_streaming_uneven_chunks(crypto_perpetual_ethusdt: CryptoPerpetual) {
 }
 
 #[rstest]
-fn test_multiple_data_configs_mixed_types(crypto_perpetual_ethusdt: CryptoPerpetual) {
+#[case::oneshot(None)]
+#[case::streaming(Some(3))]
+fn test_multiple_data_configs_mixed_types(
+    crypto_perpetual_ethusdt: CryptoPerpetual,
+    #[case] chunk_size: Option<usize>,
+) {
     let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt);
     let base_ts = 1_000_000_000u64;
     let (_temp_dir, catalog_path) =
@@ -1019,6 +1024,7 @@ fn test_multiple_data_configs_mixed_types(crypto_perpetual_ethusdt: CryptoPerpet
     let config = BacktestRunConfig::builder()
         .venues(vec![binance_venue_config()])
         .data(vec![quote_data, trade_data])
+        .maybe_chunk_size(chunk_size)
         .build()
         .unwrap();
 

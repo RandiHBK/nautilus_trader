@@ -15,7 +15,7 @@
 
 //! Provides a [`BacktestNode`] that orchestrates catalog-driven backtests.
 
-use std::iter::Peekable;
+use std::{cmp::Ordering, collections::BinaryHeap, iter::Peekable};
 
 use ahash::{AHashMap, AHashSet};
 use nautilus_core::UnixNanos;
@@ -402,16 +402,109 @@ fn run_streaming(
         // Single config: stream directly from catalog iterator without
         // materializing the full dataset, bounded by chunk_size
         let data_config = &data_configs[0];
-        let mut catalog = create_catalog(data_config)?;
-        let result = dispatch_query(&mut catalog, data_config, config.start(), config.end())?;
-        stream_chunks(engine, config, result.peekable(), chunk_size)?;
+        let stream = open_data_stream(data_config, config.start(), config.end())?;
+        stream_chunks(engine, config, stream.peekable(), chunk_size)?;
     } else {
-        // Multiple configs require loading all data to merge-sort across types
-        let all_data = load_and_merge_data(config)?;
-        stream_chunks(engine, config, all_data.into_iter().peekable(), chunk_size)?;
+        // Lazily merge the ordered catalog streams. Each query retains only a
+        // bounded number of record batches plus one merge head, so memory no
+        // longer scales with the full queried time range.
+        let streams = data_configs
+            .iter()
+            .map(|data_config| open_data_stream(data_config, config.start(), config.end()))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let merged = StreamingDataMerger::new(streams);
+        stream_chunks(engine, config, merged.peekable(), chunk_size)?;
     }
 
     Ok(())
+}
+
+struct CatalogDataStream {
+    result: QueryResult,
+    // Keep the catalog and its DataFusion session alive while consuming the query.
+    _catalog: ParquetDataCatalog,
+}
+
+impl Iterator for CatalogDataStream {
+    type Item = Data;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.result.next()
+    }
+}
+
+struct StreamHead {
+    data: Data,
+    stream_index: usize,
+}
+
+impl PartialEq for StreamHead {
+    fn eq(&self, other: &Self) -> bool {
+        self.data.ts_init() == other.data.ts_init() && self.stream_index == other.stream_index
+    }
+}
+
+impl Eq for StreamHead {}
+
+impl Ord for StreamHead {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse timestamp and stream index ordering because BinaryHeap is a max-heap.
+        // The stream index preserves config order for equal timestamps, matching the
+        // previous stable full-vector sort.
+        other
+            .data
+            .ts_init()
+            .cmp(&self.data.ts_init())
+            .then_with(|| other.stream_index.cmp(&self.stream_index))
+    }
+}
+
+impl PartialOrd for StreamHead {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct StreamingDataMerger<I> {
+    streams: Vec<I>,
+    heap: BinaryHeap<StreamHead>,
+}
+
+impl<I> StreamingDataMerger<I>
+where
+    I: Iterator<Item = Data>,
+{
+    fn new(mut streams: Vec<I>) -> Self {
+        let mut heap = BinaryHeap::with_capacity(streams.len());
+
+        for (stream_index, stream) in streams.iter_mut().enumerate() {
+            if let Some(data) = stream.next() {
+                heap.push(StreamHead { data, stream_index });
+            }
+        }
+
+        Self { streams, heap }
+    }
+}
+
+impl<I> Iterator for StreamingDataMerger<I>
+where
+    I: Iterator<Item = Data>,
+{
+    type Item = Data;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let head = self.heap.pop()?;
+
+        if let Some(data) = self.streams[head.stream_index].next() {
+            self.heap.push(StreamHead {
+                data,
+                stream_index: head.stream_index,
+            });
+        }
+
+        Some(head.data)
+    }
 }
 
 // Feeds data from an iterator to the engine in timestamp-aligned chunks.
@@ -486,21 +579,6 @@ fn take_aligned_chunk<I: Iterator<Item = Data>>(
     chunk
 }
 
-fn load_and_merge_data(config: &BacktestRunConfig) -> anyhow::Result<Vec<Data>> {
-    let mut all_data = Vec::new();
-
-    for data_config in config.data() {
-        let data = load_data(data_config, config.start(), config.end())?;
-        if data.is_empty() {
-            log::warn!("No data found for config: {:?}", data_config.data_type());
-            continue;
-        }
-        all_data.extend(data);
-    }
-    all_data.sort_by_key(HasTsInit::ts_init);
-    Ok(all_data)
-}
-
 fn create_catalog(config: &BacktestDataConfig) -> anyhow::Result<ParquetDataCatalog> {
     let uri = match config.catalog_fs_protocol() {
         Some(protocol) => format!("{protocol}://{}", config.catalog_path()),
@@ -511,6 +589,19 @@ fn create_catalog(config: &BacktestDataConfig) -> anyhow::Result<ParquetDataCata
         .cloned()
         .or_else(|| config.catalog_fs_storage_options().cloned());
     ParquetDataCatalog::from_uri(&uri, storage_options, None, None, None)
+}
+
+fn open_data_stream(
+    config: &BacktestDataConfig,
+    run_start: Option<UnixNanos>,
+    run_end: Option<UnixNanos>,
+) -> anyhow::Result<CatalogDataStream> {
+    let mut catalog = create_catalog(config)?;
+    let result = dispatch_query(&mut catalog, config, run_start, run_end)?;
+    Ok(CatalogDataStream {
+        result,
+        _catalog: catalog,
+    })
 }
 
 fn load_data(
