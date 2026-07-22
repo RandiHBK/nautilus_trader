@@ -1846,14 +1846,18 @@ impl ExecutionManager {
     ) -> Vec<OrderEventAny> {
         log::debug!("Checking position consistency between cached-state and venues");
 
-        let mut venue_positions = IndexMap::new();
+        let mut venue_positions: IndexMap<InstrumentAccountKey, Vec<PositionStatusReport>> =
+            IndexMap::new();
 
         for report in reports {
             if !self.should_reconcile_instrument(&report.instrument_id) {
                 continue;
             }
 
-            venue_positions.insert((report.instrument_id, report.account_id), report);
+            venue_positions
+                .entry((report.instrument_id, report.account_id))
+                .or_default()
+                .push(report);
         }
 
         let mut events = Vec::new();
@@ -1874,9 +1878,12 @@ impl ExecutionManager {
                 continue;
             }
 
-            let venue_report = venue_positions.get(key);
+            let venue_reports = venue_positions
+                .get(key)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
 
-            if venue_report.is_none() {
+            if venue_reports.is_empty() {
                 match check.client_coverage.get(key) {
                     Some(ReportClientCoverage::Resolved(responsible_clients))
                         if !responsible_clients.is_empty()
@@ -1925,16 +1932,20 @@ impl ExecutionManager {
                 }
             }
 
-            if let Some(discrepancy_events) = self.check_position_discrepancy(*key, venue_report) {
+            if let Some(discrepancy_events) = self.check_position_discrepancy(*key, venue_reports) {
                 events.extend(discrepancy_events);
             }
         }
 
         let current_position_keys = self.open_position_keys_for_reconciliation();
 
-        for (key, venue_report) in &venue_positions {
+        for (key, venue_reports) in &venue_positions {
             if check.client_coverage.contains_key(key)
-                || venue_report.signed_decimal_qty == Decimal::ZERO
+                || venue_reports
+                    .iter()
+                    .map(|report| report.signed_decimal_qty)
+                    .sum::<Decimal>()
+                    == Decimal::ZERO
             {
                 continue;
             }
@@ -1948,9 +1959,7 @@ impl ExecutionManager {
                 continue;
             }
 
-            if let Some(discrepancy_events) =
-                self.check_position_discrepancy(*key, Some(venue_report))
-            {
+            if let Some(discrepancy_events) = self.check_position_discrepancy(*key, venue_reports) {
                 events.extend(discrepancy_events);
             }
         }
@@ -1962,7 +1971,11 @@ impl ExecutionManager {
             .chain(
                 venue_positions
                     .iter()
-                    .filter(|(_, r)| r.signed_decimal_qty != Decimal::ZERO)
+                    .filter(|(_, reports)| {
+                        reports
+                            .iter()
+                            .any(|report| report.signed_decimal_qty != Decimal::ZERO)
+                    })
                     .map(|(k, _)| *k),
             )
             .collect();
@@ -2516,7 +2529,7 @@ impl ExecutionManager {
     fn check_position_discrepancy(
         &mut self,
         key: InstrumentAccountKey,
-        venue_report: Option<&PositionStatusReport>,
+        venue_reports: &[PositionStatusReport],
     ) -> Option<Vec<OrderEventAny>> {
         let (instrument_id, account_id) = key;
 
@@ -2532,7 +2545,18 @@ impl ExecutionManager {
             .iter()
             .map(Position::signed_decimal_qty)
             .sum();
-        let venue_signed_qty = venue_report.map_or(Decimal::ZERO, |r| r.signed_decimal_qty);
+        let venue_signed_qty: Decimal = venue_reports
+            .iter()
+            .map(|report| report.signed_decimal_qty)
+            .sum();
+        let nonflat_count = venue_reports
+            .iter()
+            .filter(|report| report.signed_decimal_qty != Decimal::ZERO)
+            .count();
+        let venue_report = venue_reports
+            .iter()
+            .find(|report| report.signed_decimal_qty != Decimal::ZERO)
+            .or_else(|| venue_reports.last());
 
         let tolerance = self.position_reconciliation_tolerance(account_id);
         if (cached_signed_qty - venue_signed_qty).abs() <= tolerance {
@@ -2556,6 +2580,22 @@ impl ExecutionManager {
         let retries = *self.position_recon_retries.get(&key).unwrap_or(&0);
 
         if retries >= self.config.position_check_retries {
+            return None;
+        }
+
+        if nonflat_count > 1 {
+            let new_retries = retries + 1;
+            self.position_recon_retries.insert(key, new_retries);
+            log::warn!(
+                "Deferring position reconciliation for {instrument_id}/{account_id}: {nonflat_count} non-flat venue reports have aggregate quantity {venue_signed_qty}, which differs from cached quantity {cached_signed_qty}"
+            );
+
+            if new_retries >= self.config.position_check_retries {
+                log::error!(
+                    "Position discrepancy for {instrument_id}/{account_id} unresolved after {} attempts; no further reconciliation attempts will be made",
+                    self.config.position_check_retries,
+                );
+            }
             return None;
         }
 
